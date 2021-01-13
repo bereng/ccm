@@ -572,6 +572,7 @@ class Node(object):
                     else:
                         process.poll()
                         if process.returncode == 0:
+                            common.debug("Process {} terminated. Watch_for_logs will not continue".format(process.pid))
                             return None
 
     def watch_log_for_no_errors(self, exprs, from_mark=None, timeout=600, process=None, verbose=False, filename='system.log'):
@@ -838,13 +839,13 @@ class Node(object):
             print_("Started: {0} with pid: {1}".format(self.name, self.pid), file=sys.stderr, flush=True)
         elif update_pid:
             self._update_pid(process)
-
             if not self.is_running():
                 raise NodeError("Error starting node %s" % self.name, process)
+            assert self.pid is not None
 
         # If wait_other_notice is a bool, we don't want to treat it as a
         # timeout. Other intlike types, though, we want to use.
-        if common.is_intlike(wait_other_notice) and not isinstance(wait_other_notice, bool):
+        if common.is_int_not_bool(wait_other_notice):
             for node, mark in marks:
                 node.watch_log_for_alive(self, from_mark=mark, timeout=wait_other_notice)
         elif wait_other_notice:
@@ -853,7 +854,7 @@ class Node(object):
 
         # If wait_for_binary_proto is a bool, we don't want to treat it as a
         # timeout. Other intlike types, though, we want to use.
-        if common.is_intlike(wait_for_binary_proto) and not isinstance(wait_for_binary_proto, bool):
+        if common.is_int_not_bool(wait_for_binary_proto):
             self.wait_for_binary_interface(from_mark=self.mark, timeout=wait_for_binary_proto)
         elif wait_for_binary_proto:
             self.wait_for_binary_interface(from_mark=self.mark)
@@ -1864,54 +1865,56 @@ class Node(object):
         with open(topology_file, 'w') as f:
             f.write(content)
 
+    def _is_pid_running(self):
+        if self.pid is None:
+            return False
+        if common.is_win():
+            return self._find_pid_on_windows()
+        else:
+            return self._find_pid_on_unix()
+
+    def _find_pid_on_unix(self):
+        try:
+            os.kill(self.pid, 0)
+            proc = psutil.Process(self.pid)
+            if proc.status() == psutil.STATUS_ZOMBIE:
+                time.sleep(2)
+                raise OSError(errno.ESRCH, "process was zombie, ignoring")
+        except OSError as err:
+            if err.errno == errno.ESRCH:
+                # not running
+                return False
+            elif err.errno == errno.EPERM:
+                # no permission to signal this process
+                return False
+            else:
+                # some other error
+                raise
+        except psutil.NoSuchProcess as err:
+            return False
+        else:
+            return True
+
     def __update_status(self):
         if self.pid is None:
-            if self.status == Status.UP or self.status == Status.DECOMMISSIONED:
+            if self.status in [Status.UP, Status.DECOMMISSIONED]:
                 self.status = Status.DOWN
             return
 
         old_status = self.status
 
-        # os.kill on windows doesn't allow us to ping a process
-        if common.is_win():
-            self.__update_status_win()
+        pid_alive = self._is_pid_running()
+        if pid_alive:
+            if self.status in [Status.DOWN, Status.UNINITIALIZED]:
+                self.status = Status.UP
         else:
-            try:
-                os.kill(self.pid, 0)
-                proc = psutil.Process(self.pid)
-                if proc.status() == psutil.STATUS_ZOMBIE:
-                    time.sleep(2)
-                    raise OSError(errno.ESRCH, "process was zombie, ignoring")
-            except OSError as err:
-                if err.errno == errno.ESRCH:
-                    # not running
-                    if self.status == Status.UP or self.status == Status.DECOMMISSIONED:
-                        self.status = Status.DOWN
-                elif err.errno == errno.EPERM:
-                    # no permission to signal this process
-                    if self.status == Status.UP or self.status == Status.DECOMMISSIONED:
-                        self.status = Status.DOWN
-                else:
-                    # some other error
-                    raise err
-            except psutil.NoSuchProcess as err:
-                if self.status == Status.UP or self.status == Status.DECOMMISSIONED:
-                    self.status = Status.DOWN
-            else:
-                if self.status == Status.DOWN or self.status == Status.UNINITIALIZED:
-                    self.status = Status.UP
+            if self.status in [Status.UP, Status.DECOMMISSIONED]:
+                self.status = Status.DOWN
 
         if not old_status == self.status:
             if old_status == Status.UP and self.status == Status.DOWN:
                 self.pid = None
             self._update_config()
-
-    def __update_status_win(self):
-        if self._find_pid_on_windows():
-            if self.status == Status.DOWN or self.status == Status.UNINITIALIZED:
-                self.status = Status.UP
-        else:
-            self.status = Status.DOWN
 
     def _find_pid_on_windows(self):
         found = False
@@ -2006,6 +2009,10 @@ class Node(object):
             os.remove(pidfile)
 
     def _update_pid(self, process):
+        """
+        Reads pid from cassandra.pid file and stores in the self.pid
+        After setting up pid updates status (UP, DOWN, etc) and node.conf
+        """
         pidfile = os.path.join(self.get_path(), 'cassandra.pid')
 
         start = time.time()

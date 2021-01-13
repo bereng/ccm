@@ -8,14 +8,13 @@ import re
 import shutil
 import signal
 import subprocess
-import sys
 import threading
 import time
 from collections import OrderedDict, defaultdict, namedtuple
 from distutils.version import LooseVersion #pylint: disable=import-error, no-name-in-module
 
 import yaml
-from six import iteritems, print_
+from six import print_
 
 from ccmlib import common, extension, repository
 from ccmlib.node import Node, NodeError, TimeoutError
@@ -264,11 +263,7 @@ class Cluster(object):
         dcs = []
 
         if use_vnodes is None:
-            self.use_vnodes = (
-                (tokens is not None and len(tokens) > 1)
-                    or ('num_tokens' in self._config_options
-                        and self._config_options['num_tokens'] is not None
-                        and int(self._config_options['num_tokens']) > 1))
+            self.use_vnodes = len(tokens or []) > 1 or self._more_than_one_token_configured()
         else:
             self.use_vnodes = use_vnodes
 
@@ -374,11 +369,14 @@ class Cluster(object):
         tokens.extend(new_tokens)
         return tokens
 
+    def _more_than_one_token_configured(self):
+        num_tokens = self._config_options.get('num_tokens', None)
+        return num_tokens is not None and int(num_tokens) > 1
+
     def can_generate_tokens(self):
         return (self.cassandra_version() >= '4'
                     and (self.partitioner is None or ('Murmur3' in self.partitioner or 'Random' in self.partitioner))
-                    and ('num_tokens' in self._config_options
-                            and self._config_options['num_tokens'] is not None and int(self._config_options['num_tokens']) > 1))
+                    and self._more_than_one_token_configured)
 
     def generated_tokens(self, dcs):
         tokens = []
@@ -398,7 +396,7 @@ class Cluster(object):
     def generate_dc_tokens(self, node_count, tokens):
         if self.cassandra_version() < '4' or (self.partitioner and not ('Murmur3' in self.partitioner or 'Random' in self.partitioner)):
             raise common.ArgumentError("generate-tokens script only for >=4.0 and Murmur3 or Random")
-        if not ('num_tokens' in self._config_options and self._config_options['num_tokens'] is not None and int(self._config_options['num_tokens']) > 1):
+        if not self._more_than_one_token_configured():
             raise common.ArgumentError("Cannot use generate-tokens script without num_tokens > 1")
 
         partitioner = 'RandomPartitioner' if ( self.partitioner and 'Random' in self.partitioner) else 'Murmur3Partitioner'
@@ -518,7 +516,6 @@ class Cluster(object):
 
                 # if the node is going to allocate_strategy_ tokens during start, then wait_for_binary_proto=True
                 node_wait_for_binary_proto = (self.can_generate_tokens() and self.use_vnodes and node.initial_token is None)
-
                 p = node.start(update_pid=False, jvm_args=jvm_args, jvm_version=jvm_version,
                                profile_options=profile_options, verbose=verbose, quiet_start=quiet_start,
                                allow_root=allow_root, wait_for_binary_proto=node_wait_for_binary_proto)
