@@ -505,12 +505,21 @@ class Node(object):
             print_("[{} ERROR] {}".format(name, stderr.strip()))
 
     # This will return when exprs are found or it timeouts
-    def watch_log_for(self, exprs, from_mark=None, timeout=600, process=None, verbose=False, filename='system.log'):
+    def watch_log_for(self, exprs, from_mark=None, timeout=600,
+                      process=None, verbose=False, filename='system.log',
+                      abort_function=None):
         """
         Watch the log until one or more (regular) expressions are found or timeouts (a
         TimeoutError is then raised). On successful completion, a list of pair (line matched,
         match object) is returned.
+
+        "abort_function" can be provided e.g. to abort if C* process is terminated
+        it will be called every time no more log lines are read()
+        and can raise any exception e.g. NodeError or TimeoutError
         """
+        if abort_function is not None:
+            assert callable(abort_function)
+
         start = time.time()
         tofind = [exprs] if isinstance(exprs, string_types) else exprs
         tofind = [re.compile(e) for e in tofind]
@@ -519,12 +528,19 @@ class Node(object):
         if len(tofind) == 0:
             return None
 
+        def check_timeout(msg):
+            if start + timeout < time.time():
+                tstamp = time.strftime("%d %b %Y %H:%M:%S", time.gmtime())
+                raise TimeoutError("{tstamp} [{name}] after {d}/{t} seconds {msg}".format(
+                    tstamp=tstamp, name=self.name, msg=msg, d=round(time.time()-start, 2), t=timeout))
+
+
         log_file = os.path.join(self.log_directory(), filename)
         output_read = False
         while not os.path.exists(log_file):
             time.sleep(.5)
-            if start + timeout < time.time():
-                raise TimeoutError(time.strftime("%d %b %Y %H:%M:%S", time.gmtime()) + " [" + self.name + "] Timed out waiting for {} to be created.".format(log_file))
+            check_timeout("Timed out waiting for {} to be created.".format(log_file))
+
             if process and not output_read:
                 process.poll()
                 if process.returncode is not None:
@@ -560,20 +576,32 @@ class Node(object):
                             if len(tofind) == 0:
                                 return matchings[0] if isinstance(exprs, string_types) else matchings
                 else:
-                    # yep, it's ugly
+                    # wait for the situation to clarify, either stop or just a pause in log production
                     time.sleep(1)
-                    if start + timeout < time.time():
-                        raise TimeoutError(time.strftime("%d %b %Y %H:%M:%S", time.gmtime()) + " [" + self.name + "] Missing: " + str([e.pattern for e in tofind]) + ":\n" + reads[:50] + ".....\nSee {} for remainder".format(filename))
 
-                if process:
-                    if common.is_win():
-                        if not self.is_running():
-                            return None
-                    else:
-                        process.poll()
-                        if process.returncode == 0:
-                            common.debug("Process {} terminated. Watch_for_logs will not continue".format(process.pid))
-                            return None
+                    # check if abort condition is not met e.g. C* process is terminated
+                    if abort_function is not None:
+                        abort_function()
+
+                    # check if timeout passed
+                    check_timeout("Missing: " + str([e.pattern for e in tofind]) +
+                                  ":\n" + reads[:50] +
+                                  ".....\nSee {} for remainder".format(filename))
+
+                    # Checking "process" is tricky, as it may be itself terminated e.g. after "verbose"
+                    # or if there is some race condition between log checking and start process finish
+                    # I am simply afraid to completely remove it because this is general usage method
+                    # so instead we will use it IFF the pid-based abort function is not provided
+                    if process and abort_function is None:
+                        if common.is_win():
+                            if not self.is_running():
+                                return None
+                        else:
+                            process.poll()
+                            if process.returncode == 0:
+                                common.debug("{pid} or its child process terminated. watch_for_logs() for {l} will not continue.".format(
+                                    pid=process.pid, l=[e.pattern for e in tofind]))
+                                return None
 
     def watch_log_for_no_errors(self, exprs, from_mark=None, timeout=600, process=None, verbose=False, filename='system.log'):
         """
@@ -631,6 +659,13 @@ class Node(object):
         tofind = ["%s.* now UP" % node.address_for_version(self.get_cassandra_version()) for node in tofind]
         self.watch_log_for(tofind, from_mark=from_mark, timeout=timeout, filename=filename)
 
+    def raise_node_error_if_cassandra_process_is_terminated(self):
+        up = self._is_pid_running()
+        if not up:
+            msg = "C* process with {pid} is terminated".format(pid=self.pid)
+            common.debug(msg)
+            raise NodeError(msg)
+
     def wait_for_binary_interface(self, **kwargs):
         """
         Waits for the Binary CQL interface to be listening.  If > 1.2 will check
@@ -638,9 +673,14 @@ class Node(object):
         interface to be listening.
 
         Emits a warning if not listening after given timeout (default NODE_WAIT_TIMEOUT_IN_SECS) in seconds.
+        Raises NodeError if C* process terminates during start.
+        Raises TimeoutError if log message for "starting listening" is not found in logs in given timeout.
         """
         timeout = kwargs.get('timeout', NODE_WAIT_TIMEOUT_IN_SECS)
         kwargs['timeout'] = timeout
+
+        if self.pid:
+            kwargs['abort_function'] = self.raise_node_error_if_cassandra_process_is_terminated
 
         if self.cluster.version() >= '1.2':
             self.watch_log_for("Starting listening for CQL clients", **kwargs)
@@ -728,6 +768,8 @@ class Node(object):
 
         if wait_other_notice:
             marks = [(node, node.mark_log()) for node in list(self.cluster.nodes.values()) if node.is_live()]
+        else:
+            marks = []
 
         self.mark = self.mark_log()
 
@@ -805,17 +847,16 @@ class Node(object):
         # we risk reading the old cassandra.pid file
         self._delete_old_pid()
 
-        process = None
-        start_time = time.time()
         # Always write the stdout+stderr of the launched process to log files to make finding startup issues easier.
+        start_time = time.time()
         stdout_sink = open(os.path.join(self.log_directory(), 'startup-{}-stdout.log'.format(start_time)), "w+")
-        # write stderr to a temporary file to prevent overwhelming pipe (> 65K data).
         stderr_sink = open(os.path.join(self.log_directory(), 'startup-{}-stderr.log'.format(start_time)), "w+")
 
         if common.is_win():
             # clean up any old dirty_pid files from prior runs
-            if (os.path.isfile(self.get_path() + "/dirty_pid.tmp")):
-                os.remove(self.get_path() + "/dirty_pid.tmp")
+            dirty_pid_path = os.path.join(self.get_path() + "dirty_pid.tmp")
+            if (os.path.isfile(dirty_pid_path)):
+                os.remove(dirty_pid_path)
 
             if quiet_start and self.cluster.version() >= '2.2.4':
                 args.append('-q')
@@ -827,6 +868,7 @@ class Node(object):
         process.stderr_file = stderr_sink
 
         if verbose:
+            common.debug("verbose mode: waiting for the start process out/err (and termination)")
             stdout, stderr = process.communicate()
             print_(str(stdout))
             print_(str(stderr))
@@ -837,14 +879,13 @@ class Node(object):
             self.__clean_win_pid()
             self._update_pid(process)
             print_("Started: {0} with pid: {1}".format(self.name, self.pid), file=sys.stderr, flush=True)
-        elif update_pid:
-            self._update_pid(process)
-            if not self.is_running():
-                raise NodeError("Error starting node %s" % self.name, process)
-            assert self.pid is not None
 
-        # If wait_other_notice is a bool, we don't want to treat it as a
-        # timeout. Other intlike types, though, we want to use.
+        if update_pid or wait_for_binary_proto:
+            # at this moment we should have PID and it should be running...
+            if not self._wait_for_running(process, timeout_s=7):
+                raise NodeError("Node {n} is not running".format(n=self.name), process)
+
+        # if requested wait for other nodes to observe this one (via gossip)
         if common.is_int_not_bool(wait_other_notice):
             for node, mark in marks:
                 node.watch_log_for_alive(self, from_mark=mark, timeout=wait_other_notice)
@@ -852,14 +893,22 @@ class Node(object):
             for node, mark in marks:
                 node.watch_log_for_alive(self, from_mark=mark)
 
-        # If wait_for_binary_proto is a bool, we don't want to treat it as a
-        # timeout. Other intlike types, though, we want to use.
+        # if requested wait for binary protocol to start
         if common.is_int_not_bool(wait_for_binary_proto):
             self.wait_for_binary_interface(from_mark=self.mark, timeout=wait_for_binary_proto)
         elif wait_for_binary_proto:
             self.wait_for_binary_interface(from_mark=self.mark)
 
         return process
+
+    def _wait_for_running(self, process, timeout_s):
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if self.is_running():
+                return True
+            time.sleep(0.5)
+            self._update_pid(process)
+        return self.is_running()
 
     def stop(self, wait=True, wait_other_notice=False, signal_event=signal.SIGTERM, **kwargs):
         """

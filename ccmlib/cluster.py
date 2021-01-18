@@ -533,11 +533,15 @@ class Cluster(object):
             time.sleep(2)  # waiting 2 seconds to check for early errors and for the pid to be set
         else:
             for node, p, mark in started:
+                if not node._wait_for_running(p, timeout_s=7):
+                    raise NodeError("Node {} should be running before waiting for <started listening> log message, "
+                                    "but C* process is terminated.".format(node.name))
                 try:
                     timeout=kwargs.get('timeout', DEFAULT_CLUSTER_WAIT_TIMEOUT_IN_SECS)
                     timeout=int(os.environ.get('CCM_CLUSTER_START_TIMEOUT_OVERRIDE', timeout))
                     start_message = "Listening for thrift clients..." if self.cassandra_version() < "2.2" else "Starting listening for CQL clients"
-                    node.watch_log_for(start_message, timeout=timeout, process=p, verbose=verbose, from_mark=mark)
+                    node.watch_log_for(start_message, timeout=timeout, process=p, verbose=verbose, from_mark=mark,
+                                       abort_function=node.raise_node_error_if_cassandra_process_is_terminated)
                 except RuntimeError:
                     return None
 
